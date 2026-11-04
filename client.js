@@ -12,7 +12,7 @@
  */
 
 window.__ModuleLoader__.load({
-  id: 'dsh-skill-panel',
+  id: '@lovenndme/dsh-skill-panel',
   factory(require) {
     const React = require('react')
     const h = React.createElement

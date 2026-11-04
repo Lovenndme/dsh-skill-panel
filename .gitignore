@@ -1,0 +1,4 @@
+node_modules/
+.next-version
+release-notes.md
+*.tmp

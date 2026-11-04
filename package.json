@@ -1,7 +1,7 @@
 {
-  "name": "dsh-skill-panel",
+  "name": "@lovenndme/dsh-skill-panel",
   "version": "0.1.0",
-  "description": "Skill management panel for the DeepSeek Harness Web UI: lists global and per-project skills, toggles model and command invocation per scope, views and edits SKILL.md, and creates, imports or deletes skills.",
+  "description": "Skill management panel for the DeepSeek Harness Web UI: lists global and per-project skills, enables or disables model and slash-command invocation, previews and edits SKILL.md, and creates, imports or deletes skills.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -19,8 +19,12 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test test/host.test.mjs test/apply.test.mjs"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -31,6 +35,18 @@
     "skill-panel"
   ],
   "license": "MIT",
+  "author": "Lovenndme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lovenndme/dsh-skill-panel.git"
+  },
+  "homepage": "https://github.com/Lovenndme/dsh-skill-panel#readme",
+  "bugs": {
+    "url": "https://github.com/Lovenndme/dsh-skill-panel/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "dsh": ">=0.2.1-rc.5 <0.3.0-0"
   },
@@ -40,13 +56,16 @@
     },
     "client": {
       "platform": "web",
-      "immediately": true
+      "immediately": true,
+      "inject": [
+        "slots"
+      ]
     },
     "compatibility": {
       "dshReleases": {
         "0.2.1-rc.5": "verified"
       },
-      "note": "Host half uses ctx.webServer.register (top-level inject, so routes register once the carrier exists) and ctx.get('workspaceRegistry') optionally for the project picker. Client half uses the settings.section slot. Skill roots and the frontmatter contract mirror @deepseek-ai/dsh-skill-filesystem."
+      "note": "Host half registers its own HTTP routes under /api/dsh-skill-panel/* behind the Connection trust fence, and reads skill load state through agentPresets.acquireScope + skills.snapshot({ scope }) because the filesystem provider lives in preset scope on 0.2.x. Client half uses the settings.section slot. Skill roots and the frontmatter contract mirror @deepseek-ai/dsh-skill-filesystem."
     }
   }
 }

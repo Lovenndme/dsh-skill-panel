@@ -1,0 +1,163 @@
+name: Release pending commits
+
+# Releases are batched and the version is decided at release time, not per change:
+#   - day to day you only commit (tests + commit, no version bump, no CHANGELOG edit)
+#   - this workflow runs every 4 hours, and when there are commits after the last release tag it
+#     bumps the patch version, writes a CHANGELOG section from those commit subjects, commits that,
+#     publishes to npm, and tags the released commit.
+# Running here (not on the author's machine) means a release still happens while their computer is off.
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Do everything except npm publish and the tag push
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-pending
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Is there anything to release?
+        id: gate
+        run: |
+          set -euo pipefail
+          last="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          if [ -n "$last" ]; then
+            count="$(git rev-list --count "$last"..HEAD)"
+            echo "last release tag: $last"
+          else
+            count="$(git rev-list --count HEAD)"
+            echo "no release tag yet"
+          fi
+          echo "commits since last release: $count"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          if [ "$count" -gt 0 ]; then
+            echo "pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pending=false" >> "$GITHUB_OUTPUT"
+            echo "没有待发布的提交，跳过"
+          fi
+
+      - name: Bump version and write the CHANGELOG section
+        if: steps.gate.outputs.pending == 'true'
+        id: bump
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('fs')
+          const pkgPath = 'package.json'
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+          const [major, minor, patch] = pkg.version.split('-')[0].split('.').map(Number)
+          const next = `${major}.${minor}.${patch + 1}`
+          pkg.version = next
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n')
+          fs.writeFileSync('.next-version', next)
+          console.log('bumped to', next)
+          NODE
+          version="$(cat .next-version)"
+          rm -f .next-version
+          last="${{ steps.gate.outputs.last }}"
+          if [ -n "$last" ]; then range="$last..HEAD"; else range="HEAD"; fi
+          {
+            printf '# Changelog\n\n## %s — %s\n\n' "$version" "$(date -u +%Y-%m-%d)"
+            git log --no-merges --pretty='- %s' $range
+            printf '\n'
+            if [ -f CHANGELOG.md ]; then tail -n +2 CHANGELOG.md; fi
+          } > CHANGELOG.tmp
+          mv CHANGELOG.tmp CHANGELOG.md
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          head -n 12 CHANGELOG.md
+
+      - name: Syntax check and tests
+        if: steps.gate.outputs.pending == 'true'
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check lib/skills.js
+          node --test test/host.test.mjs test/apply.test.mjs
+
+      - name: Commit the release
+        if: steps.gate.outputs.pending == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json CHANGELOG.md
+          git commit -m "release: v${{ steps.bump.outputs.version }}"
+          git push
+          echo "released commit: $(git rev-parse --short HEAD)"
+
+      - name: Publish to npm
+        if: steps.gate.outputs.pending == 'true' && inputs.dry_run != true
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag the released commit
+        if: steps.gate.outputs.pending == 'true' && inputs.dry_run != true
+        run: |
+          set -euo pipefail
+          git tag "v${{ steps.bump.outputs.version }}"
+          git push origin "v${{ steps.bump.outputs.version }}"
+
+      # A GitHub Release is the notification channel: one email per real publish, and none for the
+      # every-4-hours runs that find nothing to do. It also gives the version a readable changelog page.
+      - name: Publish the release notes
+        if: steps.gate.outputs.pending == 'true' && inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.bump.outputs.version }}"
+          node - <<'NODE'
+          const fs = require('fs')
+          const text = fs.readFileSync('CHANGELOG.md', 'utf8')
+          const start = text.indexOf('\n## ')
+          const rest = text.slice(start + 1)
+          const next = rest.indexOf('\n## ', 1)
+          fs.writeFileSync('release-notes.md', next === -1 ? rest : rest.slice(0, next))
+          NODE
+          gh release create "v${version}" \
+            --title "v${version}" \
+            --notes-file release-notes.md \
+            --verify-tag || gh release edit "v${version}" --notes-file release-notes.md
+
+      # The publish already succeeded at this point, so a slow CDN must never fail the run: a red X
+      # here sends the owner a scary mail for a release that actually shipped.
+      - name: Wait for the registry to serve the new version
+        if: steps.gate.outputs.pending == 'true' && inputs.dry_run != true
+        run: |
+          set -uo pipefail
+          version="${{ steps.bump.outputs.version }}"
+          name="$(node -p "require('./package.json').name")"
+          for attempt in $(seq 1 20); do
+            sleep 30
+            live="$(npm view "$name" version)"
+            echo "attempt=$attempt registry=$live"
+            if [ "$live" = "$version" ]; then
+              echo "registry now serves $version"
+              exit 0
+            fi
+          done
+          echo "::warning::published $version, but the registry still serves $live after 10 minutes — the publish itself succeeded"
+          exit 0

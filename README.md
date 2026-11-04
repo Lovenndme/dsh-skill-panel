@@ -1,6 +1,6 @@
 # dsh-skill-panel
 
-DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「全局」和「本项目」两层技能。
+`@lovenndme/dsh-skill-panel` — DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「全局」和「本项目」两层技能。
 
 - 列表：名称、描述、来源（全局 / 本项目）、路径、模型可调用、`/命令` 可调用、同名覆盖情况
 - 安装位置：技能装在哪里，只在**新建 / 导入时选择一次**——「全局」（`~/.dsh/skills`，所有项目可用）或「本项目」（顶部所选项目的 `.dsh/skills`）。列表里不提供「全局 ⇄ 本项目」切换：技能本身占用的 token 很少，又是渐进式披露，不需要按项目来回搬。
@@ -38,7 +38,7 @@ DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「�
    - 出现旧键 `userInvocable` / `modelInvocable` / `disableModelInvocation`
    - `name` / `description` 未加引号，会被 YAML 读成数字、布尔或 null（规则已用 DSH 自带的 yaml 2.9.1 核对）
    - 顶层键重复
-2. **向 DSH 注册表核对**：宿主通过 `ctx.get('skills')` 拿到 DSH 的技能注册表。`/list` 给每一行标注 `dsh.state`，取值有三种：`loaded`（DSH 生效的正是这一份）、`other`（DSH 生效的是别处同名技能）、`missing`（DSH 没加载）。导入结果也逐条带 `dsh`。完整 YAML 语法错误（例如值里有未加引号的 `: `）靠这一关发现。每次写操作成功后，宿主都会调用一次 `invalidateCache()`，DSH 会立刻重扫，不必等目录监听的稳定期。拿不到注册表时，面板照常工作，只是不做标注（`dshChecked: false`）。
+2. **向 DSH 注册表核对**：宿主通过 `ctx.get('skills')` 拿到 DSH 的技能注册表。0.2.x 里本地技能 provider 挂在每个 agent preset 的作用域里，所以核对是逐个 preset `agentPresets.acquireScope(id)` → `skills.snapshot({ cwd, scope })`，用完释放租约；任一 preset 能看到这一份就算会被加载。`/list` 给每一行标注 `dsh.state`：`loaded`（有 preset 生效的正是这一份）、`other`（DSH 有同名技能，但没有任何 preset 采用这一份）、`missing`（没有任何 preset 加载这个名字）。写操作返回前会等注册表追上磁盘（最多 1.5 秒轮询），所以紧接着的 `/list` 不会读到写之前的旧视图。拿不到注册表时，面板照常工作，只是不做标注（`dshChecked: false`）。
 
 ### 作用域切换是怎么落盘的（宿主接口仍在，界面已不再提供切换）
 
@@ -66,14 +66,21 @@ DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「�
 
 ## 安全边界
 
-- 只接受 loopback 同源请求（`sec-fetch-site: cross-site` 一律 403，带 Origin 时要求 loopback 且与 Host 同源）。
+- 路由走 DSH 官方的 Connection 信任围栏（`ctx.connection.requestRejection`）：Host/Origin 检查 + 浏览器登录凭据，未登录的请求一律 401；composition 里没有 Connection 服务时才退回本机 loopback 判断。
 - 写操作先按 root 重新定位技能，不看客户端传的路径；删除前再校验目标确实位于某个技能根目录之内。
 - 导入：zip ≤32MB、解压后 ≤64MB、条目 ≤2000，路径穿越直接拒绝；目标已存在同名技能时不覆盖。
 - 占位删除只认本插件写的标记。
 
 ## 安装
 
-已在 `desktop` profile 里装为本目录的 link（entry id：`include:dsh-skill-panel`）：
+```powershell
+# npm（推荐）
+dsh plugin --profile web add @lovenndme/dsh-skill-panel
+```
+
+国内无代理时，「插件 → 添加插件」里把安装源切成「中国大陆镜像源」（`registry.npmmirror.com`），再粘贴包名；npm 包会自动同步，通常几分钟内拿到最新版。只有安装这一步需要联网。
+
+本仓库开发模式（本机 `desktop` profile 里装的是本目录的 link，entry id：`include:dsh-skill-panel`）：
 
 ```powershell
 # 装 / 重装
@@ -83,7 +90,7 @@ plugin_manager set_plugin --target include:dsh-skill-panel --enabled false
 plugin_manager set_plugin --target include:dsh-skill-panel --enabled true
 ```
 
-卸载：`plugin_manager remove_bundle --target dsh-skill-panel`。
+卸载：`plugin_manager remove_bundle --target @lovenndme/dsh-skill-panel`。
 
 ## 测试
 
@@ -96,7 +103,7 @@ node --test test/host.test.mjs test/apply.test.mjs
 
 ## 已知限制
 
-- 「本项目禁用」依赖同名占位覆盖：如果项目里本来就有同名技能，面板会拒绝而不是覆盖。
+- 旧版本留下的「本项目禁用」占位：如果项目里本来就有同名真实技能，恢复会被拒绝而不是覆盖。
 - 只扫面板认得的四个默认根；宿主 `customSkillDirs` 里挂的技能不在列表里（宁可漏报也不误报）。
 - 预设层（preset 自带、经作用域挂载的技能）不显示；面板只读写磁盘上的项目层与全局层。
 - 删除是移到 `~/.dsh/skill-panel-trash/`，不自动清理。

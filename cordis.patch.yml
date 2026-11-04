@@ -3,4 +3,4 @@
 # 浏览器半区占 settings.section 插槽，所以面板在「设置 → 技能」里。
 - insert:
     - id: dsh-skill-panel
-      name: 'dsh-skill-panel'
+      name: '@lovenndme/dsh-skill-panel'
