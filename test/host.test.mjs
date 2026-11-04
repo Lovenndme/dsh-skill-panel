@@ -15,6 +15,7 @@ import {
   importZip,
   inspectSkillDoc,
   isInside,
+  isSameOrInside,
   moveToTrash,
   parseBoolean,
   parseSkillDoc,
@@ -250,9 +251,14 @@ test('findProjectRoot 用最近的 .git 祖先', async () => {
 })
 
 test('isInside 边界', () => {
-  assert.equal(isInside('C:\\a', 'C:\\a\\b'), true)
-  assert.equal(isInside('C:\\a', 'C:\\a'), false)
-  assert.equal(isInside('C:\\a', 'C:\\b'), false)
+  // 用平台无关的路径构造，避免在 Linux CI 上被 Windows 路径字面量误判。
+  const base = path.resolve(os.tmpdir(), 'dsp-inside', 'a')
+  const sibling = path.resolve(os.tmpdir(), 'dsp-inside', 'b')
+  assert.equal(isInside(base, path.join(base, 'child')), true)
+  assert.equal(isInside(base, base), false)
+  assert.equal(isInside(base, sibling), false)
+  assert.equal(isSameOrInside(base, base), true)
+  assert.equal(isSameOrInside(base, sibling), false)
 })
 
 test('writeTextAtomic 覆盖已有文件', async () => {
