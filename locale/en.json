@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Skill Panel",
+    "description": "Adds a Skills page to Settings: lists global and per-project skills, toggles model and slash-command invocation per scope, views and edits SKILL.md, and creates, imports or deletes skills."
+  }
+}

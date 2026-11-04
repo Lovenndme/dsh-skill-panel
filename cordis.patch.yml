@@ -1,0 +1,6 @@
+# dsh-skill-panel：技能管理面板。
+# 宿主半区只注册本包自己的 HTTP 路由（/api/dsh-skill-panel/*），不挂任何模型工具；
+# 浏览器半区占 settings.section 插槽，所以面板在「设置 → 技能」里。
+- insert:
+    - id: dsh-skill-panel
+      name: 'dsh-skill-panel'

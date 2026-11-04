@@ -1,0 +1,52 @@
+{
+  "name": "dsh-skill-panel",
+  "version": "0.1.0",
+  "description": "Skill management panel for the DeepSeek Harness Web UI: lists global and per-project skills, toggles model and command invocation per scope, views and edits SKILL.md, and creates, imports or deletes skills.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "skill",
+    "skills",
+    "skill-manager",
+    "skill-panel"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.1-rc.5": "verified"
+      },
+      "note": "Host half uses ctx.webServer.register (top-level inject, so routes register once the carrier exists) and ctx.get('workspaceRegistry') optionally for the project picker. Client half uses the settings.section slot. Skill roots and the frontmatter contract mirror @deepseek-ai/dsh-skill-filesystem."
+    }
+  }
+}
