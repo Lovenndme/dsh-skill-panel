@@ -13,6 +13,7 @@ import {
   findProjectRoot,
   importFolder,
   importZip,
+  inspectSkillDoc,
   isInside,
   moveToTrash,
   parseBoolean,
@@ -404,4 +405,54 @@ test('importZip 根级 SKILL.md 用正文里的 name 落盘', async () => {
 test('importZip 拒绝非 zip 内容', async () => {
   const target = await makeTempDir('ziptarget2')
   await assert.rejects(() => importZip(target, Buffer.from('not a zip')), /不是有效的 zip/)
+})
+
+/* ------------------------------------------- 与 DSH 加载器（dsh-skill-filesystem）同口径 */
+
+test('inspectSkillDoc：DSH 会忽略的写法都算问题', () => {
+  const problemsOf = (text) => inspectSkillDoc(parseSkillDoc(text)).problems.join('；')
+  assert.equal(problemsOf(skillText('fine-skill', '正常')), '')
+  assert.match(problemsOf('---\ndescription: x\n---\n'), /缺少 name/)
+  assert.match(problemsOf('---\nname: a\ndescription: x\nuserInvocable: false\n---\n'), /不支持的字段 userInvocable/)
+  assert.match(problemsOf('---\nname: a\ndescription: x\nmodelInvocable: true\n---\n'), /不支持的字段 modelInvocable/)
+  assert.match(problemsOf('---\nname: a\ndescription: 12345\n---\n'), /description 会被 YAML 读成非字符串/)
+  assert.match(problemsOf('---\nname: a\ndescription: true # 注释\n---\n'), /description 会被 YAML 读成非字符串/)
+  assert.match(problemsOf('---\nname: 123\ndescription: x\n---\n'), /name 会被 YAML 读成非字符串/)
+  assert.match(problemsOf('---\nname: a\nname: b\ndescription: x\n---\n'), /name 重复出现/)
+  // 加了引号就是字符串，DSH 能加载
+  assert.equal(problemsOf("---\nname: '123'\ndescription: '12345'\n---\n"), '')
+  assert.equal(problemsOf('---\nname: a\ndescription: v1.2 版本说明\n---\n'), '')
+})
+
+test('importFolder 拒绝 DSH 不会加载的写法，并且不落盘', async () => {
+  const source = await makeTempDir('strict-src')
+  const target = await makeTempDir('strict-dst')
+  await fsp.mkdir(path.join(source, 'no-name'), { recursive: true })
+  await fsp.writeFile(path.join(source, 'no-name', 'SKILL.md'), '---\ndescription: 没写 name\n---\n\n正文\n')
+  await writeSkill(source, 'legacy-key', { extra: { userInvocable: 'false' } })
+  await writeSkill(source, 'good-one')
+  const results = await importFolder(target, source)
+  const byDir = Object.fromEntries(results.map((item) => [path.basename(item.source), item]))
+  assert.equal(byDir['no-name'].ok, false)
+  assert.match(byDir['no-name'].error, /缺少 name/)
+  assert.equal(byDir['legacy-key'].ok, false)
+  assert.match(byDir['legacy-key'].error, /userInvocable/)
+  assert.equal(byDir['good-one'].ok, true)
+  assert.ok(!existsSync(path.join(target, 'no-name')))
+  assert.ok(!existsSync(path.join(target, 'legacy-key')))
+  assert.ok(existsSync(path.join(target, 'good-one', 'SKILL.md')))
+})
+
+test('planZipSkills 不再拿目录名顶替缺失的 name', () => {
+  const buffer = buildZip([{ name: 'nameless/SKILL.md', data: "---\ndescription: '没写 name'\n---\n" }])
+  assert.throws(() => planZipSkills(buffer), /缺少 name/)
+})
+
+test('collectSkills：缺 name 的技能进 diagnostics（DSH 同样会忽略）', async () => {
+  const home = await makeTempDir('home-noname')
+  await fsp.mkdir(path.join(home, 'skills', 'dir-name'), { recursive: true })
+  await fsp.writeFile(path.join(home, 'skills', 'dir-name', 'SKILL.md'), "---\ndescription: '只有描述'\n---\n")
+  const collection = await collectSkills({ projectRoot: undefined, dshHome: home, agentsHome: path.join(home, 'agents') })
+  assert.equal(collection.skills.length, 0)
+  assert.match(collection.diagnostics[0].reason, /缺少 name/)
 })

@@ -141,6 +141,210 @@ export function apply(ctx) {
     return { ...context, collection }
   }
 
+  /* ---------------------------------------------------- 与 DSH 注册表核对 */
+
+  /** DSH 自己的技能注册表（ctx.skills）；拿不到时面板照常工作，只是不做「DSH 是否加载」的标注。 */
+  const dshRegistry = () => {
+    try {
+      const registry = typeof ctx.get === 'function' ? ctx.get('skills') : undefined
+      const usable = registry && (typeof registry.snapshot === 'function' || typeof registry.list === 'function')
+      return usable ? registry : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 预设注册表：拿得到时按每个 preset 的作用域读技能视图（本地技能 provider 挂在 preset 层）。 */
+  const dshPresets = () => {
+    try {
+      const service = typeof ctx.get === 'function' ? ctx.get('agentPresets') : undefined
+      return service && typeof service.list === 'function' && typeof service.acquireScope === 'function' ? service : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * 读一次注册表要按 preset 逐个取作用域快照，比较贵；
+   * 面板连续打开 / 写完后紧跟一次 /list 时复用 2 秒内的结果。
+   */
+  let dshCache = { key: null, at: 0, value: null }
+  const DSH_CACHE_MS = 2000
+  const invalidateDshCache = () => {
+    dshCache = { key: null, at: 0, value: null }
+  }
+
+  const LOCAL_SOURCES = new Set(['project-dsh', 'project-agents', 'user-dsh', 'user-agents'])
+
+  const addSummaries = (byName, probe, summaries) => {
+    for (const summary of summaries || []) {
+      if (!summary || typeof summary.name !== 'string') continue
+      const source = String(summary.source ?? '?')
+      const provider = String(summary.provider ?? '?')
+      probe.bySource[source] = (probe.bySource[source] || 0) + 1
+      probe.byProvider[provider] = (probe.byProvider[provider] || 0) + 1
+      if (!byName.has(summary.name)) byName.set(summary.name, summary)
+    }
+  }
+
+  /** 按作用域读一次注册表；snapshot 优先，只有 list 的旧实现也能用。 */
+  const readScope = async (registry, cwd, scope, signal) => {
+    const options = { signal }
+    if (cwd) options.cwd = cwd
+    if (scope) options.scope = scope
+    if (typeof registry.snapshot === 'function') {
+      const snapshot = await registry.snapshot(options)
+      return {
+        complete: snapshot ? snapshot.complete !== false : true,
+        skills: snapshot && Array.isArray(snapshot.skills) ? snapshot.skills : [],
+      }
+    }
+    const summaries = typeof registry.list === 'function' ? await registry.list(options) : []
+    return { complete: true, skills: Array.isArray(summaries) ? summaries : [] }
+  }
+
+  /**
+   * 读 DSH 注册表，并给出「能否据此逐行标注」的结论 probe.verdict：
+   *   checked          —— 结果完整且看得到本地技能，可以逐行标注；
+   *   incomplete       —— 注册表自己报告结果不完整（某个提供方失败等）；
+   *   no-local-skills  —— 结果里一个本地技能都没有：更可能是面板拿到的注册表视图不对，而不是每个文件都坏了；
+   *   unavailable / error —— 拿不到注册表或读取出错。
+   * 只有 checked 才标注：宁可不标，也不误报。probe 原样随 /list 返回，便于排查。
+   *
+   * 关键点（0.2.x 兼容）：`@deepseek-ai/dsh-skill-filesystem` 是挂在每个 agent preset 的
+   * plugins 里的，provider 注册在 preset 作用域那一层。不带 scope 的 snapshot 只看得到
+   * 全局层（bundled 技能），本地技能一个都看不到。所以这里对每个 preset 用
+   * `agentPresets.acquireScope(id)` 取作用域，再 `skills.snapshot({ cwd, scope })`，用完
+   * 必须在 finally 里 dispose 租约。命中语义取「任一 preset 能看到就算会被加载」。
+   */
+  const dshCatalogUncached = async (cwd) => {
+    const probe = {
+      verdict: 'unavailable',
+      cwd: cwd || null,
+      method: 'snapshot',
+      scope: 'global',
+      total: 0,
+      bySource: {},
+      byProvider: {},
+      sample: [],
+      presets: [],
+    }
+    const registry = dshRegistry()
+    if (!registry) return { byName: undefined, probe }
+    const signal = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(5000) : undefined
+    const byName = new Map()
+    try {
+      const presetsService = dshPresets()
+      if (presetsService) {
+        probe.method = 'snapshot-scoped'
+        probe.scope = 'preset-union'
+        let presets = []
+        try {
+          presets = await presetsService.list()
+        } catch (error) {
+          probe.presetsError = error instanceof Error ? error.message : String(error)
+        }
+        for (const preset of Array.isArray(presets) ? presets : []) {
+          const id = preset && preset.id ? String(preset.id) : ''
+          if (!id) continue
+          if (preset.broken) {
+            probe.presets.push({ id, skipped: 'broken' })
+            continue
+          }
+          let lease
+          try {
+            lease = await presetsService.acquireScope(id)
+            const snapshot = await readScope(registry, cwd, lease.key, signal)
+            const localCount = snapshot.skills.filter((item) => LOCAL_SOURCES.has(String(item && item.source))).length
+            probe.presets.push({
+              id,
+              total: snapshot.skills.length,
+              local: localCount,
+              complete: snapshot.complete,
+            })
+            if (!snapshot.complete) probe.complete = false
+            addSummaries(byName, probe, snapshot.skills)
+          } catch (error) {
+            probe.presets.push({ id, error: error instanceof Error ? error.message : String(error) })
+          } finally {
+            if (lease && typeof lease[Symbol.asyncDispose] === 'function') {
+              try {
+                await lease[Symbol.asyncDispose]()
+              } catch {
+                /* 租约释放失败不影响这次读取结果 */
+              }
+            }
+          }
+        }
+        // 预设层一个本地技能都没有时，再退回全局层确认，避免把「作用域没挂上」误判成「技能都没加载」
+        if (![...byName.values()].some((summary) => LOCAL_SOURCES.has(String(summary.source)))) {
+          const snapshot = await readScope(registry, cwd, undefined, signal)
+          if (!snapshot.complete) probe.complete = false
+          addSummaries(byName, probe, snapshot.skills)
+        }
+      } else {
+        const snapshot = await readScope(registry, cwd, undefined, signal)
+        probe.complete = snapshot.complete
+        addSummaries(byName, probe, snapshot.skills)
+      }
+      probe.total = byName.size
+      probe.sample = [...byName.keys()].slice(0, 12)
+      if (probe.complete === false) probe.verdict = 'incomplete'
+      else if (![...byName.values()].some((summary) => LOCAL_SOURCES.has(String(summary.source)))) probe.verdict = 'no-local-skills'
+      else probe.verdict = 'checked'
+      return { byName, probe }
+    } catch (error) {
+      probe.verdict = 'error'
+      probe.error = error instanceof Error ? error.message : String(error)
+      log(`dsh-skill-panel: 读取 DSH 技能注册表失败：${probe.error}`)
+      return { byName: undefined, probe }
+    }
+  }
+
+  const dshCatalog = async (cwd) => {
+    const key = cwd || ''
+    const now = Date.now()
+    if (dshCache.key === key && dshCache.value && now - dshCache.at < DSH_CACHE_MS) return dshCache.value
+    const value = await dshCatalogUncached(key)
+    dshCache = { key, at: Date.now(), value }
+    return value
+  }
+
+  const samePath = (left, right) => {
+    if (!left || !right) return false
+    const a = path.resolve(left)
+    const b = path.resolve(right)
+    return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+  }
+
+  /**
+   * loaded：DSH 生效的正是这一份文件；
+   * other：DSH 生效的是别处的同名技能（这份没被采用）；
+   * missing：DSH 没有加载这个名字（通常是 frontmatter 不被 DSH 接受）。
+   */
+  const dshStateOf = async (record, name, catalog) => {
+    const winner = catalog.get(name)
+    if (!winner) return { state: 'missing' }
+    if (winner.source === record.source) {
+      if (!winner.path || samePath(winner.path, record.path)) return { state: 'loaded' }
+      const real = await fsp.realpath(record.path).catch(() => record.path)
+      if (samePath(winner.path, real)) return { state: 'loaded' }
+    }
+    return { state: 'other', source: winner.source, ...(winner.path ? { path: winner.path } : {}) }
+  }
+
+  /** 给刚导入 / 新建的技能补上 DSH 加载状态（先丢掉自己的快照缓存）。 */
+  const annotateWritten = async (items, source, targetRoot, cwd) => {
+    invalidateDshCache()
+    const { byName, probe } = await dshCatalog(cwd)
+    if (probe.verdict !== 'checked') return items
+    for (const item of items) {
+      if (!item.ok || !item.name) continue
+      item.dsh = await dshStateOf({ source, path: path.join(targetRoot, item.name, 'SKILL.md') }, item.name, byName)
+    }
+    return items
+  }
+
   const requireProjectRoot = (context) => {
     if (!context.projectRoot) throw new Error('没有可用的项目目录：先在左侧工作区里打开一个项目')
     return context.projectRoot
@@ -151,13 +355,35 @@ export function apply(ctx) {
     return path.join(requireProjectRoot(context), '.dsh', 'skills')
   }
 
+  /**
+   * 路由鉴权：优先交给 DSH 自己的 Connection 信任围栏
+   * （Host/Origin 检查 + 浏览器登录凭据），没有 connection 服务时退回本机的 loopback 判断。
+   */
+  const connectionService = () => {
+    try {
+      const service = typeof ctx.get === 'function' ? ctx.get('connection') : undefined
+      return service && typeof service.requestRejection === 'function' ? service : undefined
+    } catch {
+      return undefined
+    }
+  }
+
   const guard = (handler) => async (req, res) => {
     try {
-      if (!isTrusted(req)) {
+      const connection = connectionService()
+      if (connection) {
+        const rejection = connection.requestRejection({ headers: req.headers })
+        if (rejection) {
+          sendJson(res, rejection, { ok: false, errors: [rejection === 401 ? '需要登录的 Web UI 会话' : '请求来源不受信任'] })
+          return
+        }
+      } else if (!isTrusted(req)) {
         sendJson(res, 403, { ok: false, errors: ['请求来源不受信任'] })
         return
       }
       await handler(req, res)
+      // 写操作成功后丢掉自己的快照缓存，面板随后的 /list 才会重新核对
+      if (req.method === 'POST' && res.statusCode === 200) invalidateDshCache()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       sendJson(res, 400, { ok: false, errors: [message] })
@@ -175,6 +401,11 @@ export function apply(ctx) {
         }
         const url = new URL(req.url, 'http://localhost')
         const context = await collectionOf(url)
+        const { byName, probe } = await dshCatalog(context.projectCwd)
+        const checked = probe.verdict === 'checked'
+        const skills = checked
+          ? await Promise.all(context.collection.skills.map(async (skill) => ({ ...skill, dsh: await dshStateOf(skill, skill.name, byName) })))
+          : context.collection.skills
         sendJson(res, 200, {
           ok: true,
           dshHome: dshHome(),
@@ -183,7 +414,9 @@ export function apply(ctx) {
           projectRoot: context.projectRoot,
           workspaces: context.workspaces,
           roots: context.collection.roots,
-          skills: context.collection.skills,
+          dshChecked: checked,
+          dshProbe: probe,
+          skills,
           diagnostics: context.collection.diagnostics,
         })
       }),
@@ -357,11 +590,14 @@ export function apply(ctx) {
         const body = await readJson(req)
         const context = await collectionOf(url)
         const scope = body.scope === 'global' ? 'global' : 'project'
-        const file = await createSkill(targetRootFor(scope, context), {
-          name: String(body.name || ''),
+        const targetRoot = targetRootFor(scope, context)
+        const name = String(body.name || '')
+        const file = await createSkill(targetRoot, {
+          name,
           description: String(body.description || ''),
         })
-        sendJson(res, 200, { ok: true, path: file })
+        const [checked] = await annotateWritten([{ ok: true, name }], scope === 'global' ? 'user-dsh' : 'project-dsh', targetRoot, context.projectCwd)
+        sendJson(res, 200, { ok: true, path: file, ...(checked.dsh ? { dsh: checked.dsh } : {}) })
       }),
     }),
   )
@@ -408,6 +644,7 @@ export function apply(ctx) {
           throw new Error('导入来源与目标技能目录重叠，已拒绝')
         }
         const results = await importFolder(target, source)
+        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context.projectCwd)
         sendJson(res, 200, { ok: true, results })
       }),
     }),
@@ -426,9 +663,11 @@ export function apply(ctx) {
         const context = await collectionOf(url)
         const scope = url.searchParams.get('scope') === 'global' ? 'global' : 'project'
         const payload = await readBody(req, MAX_ZIP_BYTES)
-        const results = await importZip(targetRootFor(scope, context), payload, {
+        const target = targetRootFor(scope, context)
+        const results = await importZip(target, payload, {
           name: url.searchParams.get('name') || undefined,
         })
+        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context.projectCwd)
         sendJson(res, 200, { ok: true, results })
       }),
     }),

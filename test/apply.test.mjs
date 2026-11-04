@@ -92,6 +92,130 @@ test('apply 注册全部路由且 /list 能列出两层技能', async () => {
     assert.equal(response.json.projectRoot, path.resolve(project))
     const names = response.json.skills.map((skill) => skill.name).sort()
     assert.deepEqual(names, ['global-one', 'project-one'])
+    // 拿不到 DSH 注册表时照常工作，只是不做标注
+    assert.equal(response.json.dshChecked, false)
+    assert.ok(response.json.skills.every((skill) => skill.dsh === undefined))
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('/list 与导入结果向 DSH 注册表核对实际加载状态', async () => {
+  const home = await makeTempDir('home-dsh')
+  const project = await makeTempDir('project-dsh')
+  const source = await makeTempDir('source-dsh')
+  await fsp.mkdir(path.join(project, '.git'), { recursive: true })
+  const write = async (root, name, description) => {
+    await fsp.mkdir(path.join(root, name), { recursive: true })
+    await fsp.writeFile(path.join(root, name, 'SKILL.md'), skillText(name, description))
+    return path.join(root, name, 'SKILL.md')
+  }
+  const globalLoaded = await write(path.join(home, 'skills'), 'loaded-one', '全局')
+  const globalTwin = await write(path.join(home, 'skills'), 'twin', '全局那份')
+  await write(path.join(project, '.dsh', 'skills'), 'twin', '项目那份（假设 DSH 解析失败）')
+  await write(source, 'brand-new', '导入的新技能')
+
+  // 假注册表：只认 loaded-one 与全局那份 twin；brand-new 永远不在里面（模拟 DSH 解析失败）
+  const seenScopes = []
+  const registry = {
+    async snapshot(options) {
+      seenScopes.push(options && options.scope)
+      return {
+        complete: true,
+        skills: [
+          { name: 'loaded-one', source: 'user-dsh', path: globalLoaded },
+          { name: 'twin', source: 'user-dsh', path: globalTwin },
+        ],
+      }
+    },
+  }
+  // 假预设注册表：真实 0.2.x 里本地技能 provider 挂在 preset 作用域，必须 acquireScope 才看得见
+  let disposed = 0
+  let acquired = []
+  const presetsService = {
+    async list() {
+      return [{ id: 'standard' }, { id: 'broken-one', broken: 'boom' }]
+    },
+    async acquireScope(id) {
+      acquired.push(id)
+      return {
+        key: { preset: id },
+        async [Symbol.asyncDispose]() {
+          disposed += 1
+        },
+      }
+    },
+  }
+
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const { ctx, routes } = makeCtx([{ path: project, title: 'demo' }])
+    const baseGet = ctx.get
+    ctx.get = (name) => (name === 'skills' ? registry : name === 'agentPresets' ? presetsService : baseGet(name))
+    apply(ctx)
+    const query = `?project=${encodeURIComponent(project)}`
+
+    const listed = makeRes()
+    await routes.get('/api/dsh-skill-panel/list')(makeReq({ url: `/api/dsh-skill-panel/list${query}` }), listed)
+    assert.equal(listed.json.dshChecked, true)
+    // 必须按 preset 作用域读，并且租约用完要释放
+    assert.deepEqual(acquired, ['standard'])
+    assert.equal(disposed, 1)
+    assert.deepEqual(seenScopes[0], { preset: 'standard' })
+    assert.equal(listed.json.dshProbe.method, 'snapshot-scoped')
+    assert.deepEqual(listed.json.dshProbe.presets.map((item) => item.id), ['standard', 'broken-one'])
+    const byName = Object.fromEntries(listed.json.skills.map((skill) => [skill.name, skill]))
+    assert.deepEqual(byName['loaded-one'].dsh, { state: 'loaded' })
+    assert.equal(byName.twin.source, 'project-dsh')
+    assert.equal(byName.twin.dsh.state, 'other')
+    assert.equal(byName.twin.dsh.source, 'user-dsh')
+
+    const imported = makeRes()
+    await routes.get('/api/dsh-skill-panel/import-folder')(
+      makeReq({ method: 'POST', url: `/api/dsh-skill-panel/import-folder${query}`, body: JSON.stringify({ sourcePath: source, scope: 'project' }) }),
+      imported,
+    )
+    assert.equal(imported.statusCode, 200, imported.text)
+    assert.equal(imported.json.results[0].ok, true)
+    assert.deepEqual(imported.json.results[0].dsh, { state: 'missing' })
+    // 写操作后必须重新取一次作用域快照（缓存被丢掉）
+    assert.equal(acquired.length, 2, '写操作之后要重新核对，不能吃旧缓存')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('注册表视图可疑时不逐行标注（防止整页误报「DSH 未加载」）', async () => {
+  const home = await makeTempDir('home-guard')
+  const project = await makeTempDir('project-guard')
+  await fsp.mkdir(path.join(project, '.git'), { recursive: true })
+  await fsp.mkdir(path.join(home, 'skills', 'local-one'), { recursive: true })
+  await fsp.writeFile(path.join(home, 'skills', 'local-one', 'SKILL.md'), skillText('local-one', '本地技能'))
+
+  const cases = [
+    // 结果里只有非本地来源：面板拿到的视图不对，而不是本地文件都坏了
+    { registry: { async snapshot() { return { complete: true, skills: [{ name: 'office', source: 'bundled', provider: 'office' }] } } }, verdict: 'no-local-skills' },
+    // 注册表自己报告不完整
+    { registry: { async snapshot() { return { complete: false, skills: [{ name: 'local-one', source: 'user-dsh', provider: 'filesystem' }] } } }, verdict: 'incomplete' },
+  ]
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    for (const { registry, verdict } of cases) {
+      registry.list = async () => []
+      const { ctx, routes } = makeCtx([{ path: project, title: 'demo' }])
+      const baseGet = ctx.get
+      ctx.get = (name) => (name === 'skills' ? registry : baseGet(name))
+      apply(ctx)
+      const listed = makeRes()
+      await routes.get('/api/dsh-skill-panel/list')(makeReq({ url: `/api/dsh-skill-panel/list?project=${encodeURIComponent(project)}` }), listed)
+      assert.equal(listed.json.dshChecked, false)
+      assert.equal(listed.json.dshProbe.verdict, verdict)
+      assert.ok(listed.json.skills.every((skill) => skill.dsh === undefined), `${verdict} 时不应逐行标注`)
+    }
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome

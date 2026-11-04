@@ -7,8 +7,8 @@ DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「�
   - 选「本项目」= 全局那份 frontmatter 停用 + 在 `<项目>/.dsh/skills/<name>` 复制一份**启用**的副本（内容两份，之后各自独立）；
   - 选「全局」= 把项目副本移进回收目录 + 全局那份恢复启用。
   - 项目里本来没有全局对应物的技能，选「全局」即提升为全局；旧的「占位」行选中「全局」即恢复。
-- 细节开关：详情里另有「模型可调用」「命令可调用」两个精确开关，直接改当前生效那份的 frontmatter。
-- 查看 / 编辑：详情里直接读写 SKILL.md 全文，另有「模型可调用」「/命令可调用」两个精确开关
+- 启用开关：详情里一个「启用」开关，同时改写 `disable-model-invocation` 与 `user-invocable` 两行（开 = 模型与 `/命令` 都可调用，关 = 都不可调用）；文件里只开了其中一项时显示「部分」，列表标「部分启用」，点一下统一成全开。
+- 查看 / 编辑：详情默认「预览」，frontmatter 显示为字段卡片，正文用 DSH 聊天界面同一个 Markdown 渲染器（Web 外壳共享模块 `@deepseek-ai/dsh-client-ui-primitives` 的 `MarkdownText`）。这不是文档化的插件 API，拿不到或渲染出错时退回纯文本。切到「编辑」直接读写 SKILL.md 全文，未保存的修改切回预览也能看到。
 - 新建 / 删除：可指定建在全局还是本项目；删除是移到回收目录（`~/.dsh/skill-panel-trash/`），不真删
 - 导入：本地文件夹路径（单个技能目录，或包含多个技能子目录的上层目录），或 `.zip` 压缩包
 - 搜索：名称 / 描述 / 路径
@@ -29,6 +29,17 @@ DSH 技能管理面板：在 **设置 → 技能** 里用一个页面管理「�
 - 技能 = `<root>/<name>/SKILL.md` 目录形式，或 `<root>/<name>.md` 平铺文件；只扫一层。
 - 项目根 = 从当前工作区向上找到的最近一个含 `.git` 的目录（与宿主一致，找不到退回工作区本身）。
 - 「关掉技能」只有一种官方机制：frontmatter 的 `disable-model-invocation: true`（模型不可见）与 `user-invocable: false`（`/name` 不可调用）。面板只改这两行，不动 body、不动别的键、保留 BOM 与 CRLF。
+
+### 与 DSH 实际加载结果保持一致
+
+面板自己的 frontmatter 解析是简化版。为了避免「面板显示正常、DSH 却忽略」，有两道关：
+
+1. **本地校验对齐 DSH（`inspectSkillDoc`）**：扫描、导入、保存都走同一套规则。以下写法 DSH（dsh-skill-filesystem 0.2.1-rc.5）会忽略整个技能，面板会直接拒绝并给出原因：
+   - 缺少 `name`（不再拿目录名顶替）
+   - 出现旧键 `userInvocable` / `modelInvocable` / `disableModelInvocation`
+   - `name` / `description` 未加引号，会被 YAML 读成数字、布尔或 null（规则已用 DSH 自带的 yaml 2.9.1 核对）
+   - 顶层键重复
+2. **向 DSH 注册表核对**：宿主通过 `ctx.get('skills')` 拿到 DSH 的技能注册表。`/list` 给每一行标注 `dsh.state`，取值有三种：`loaded`（DSH 生效的正是这一份）、`other`（DSH 生效的是别处同名技能）、`missing`（DSH 没加载）。导入结果也逐条带 `dsh`。完整 YAML 语法错误（例如值里有未加引号的 `: `）靠这一关发现。每次写操作成功后，宿主都会调用一次 `invalidateCache()`，DSH 会立刻重扫，不必等目录监听的稳定期。拿不到注册表时，面板照常工作，只是不做标注（`dshChecked: false`）。
 
 ### 作用域切换是怎么落盘的
 
@@ -81,8 +92,8 @@ plugin_manager set_plugin --target include:dsh-skill-panel --enabled true
 node --test test/host.test.mjs test/apply.test.mjs
 ```
 
-- `test/host.test.mjs`：frontmatter 解析 / 布尔语法 / 开关改写 / 两层去重 / 占位 / 导入 / 自造 zip（27 条里的 24 条）
-- `test/apply.test.mjs`：假 ctx 真跑 `apply()`，验证 9 条路由都注册、`/list` 出数、flags/create/save/delete 真的落盘、跨站请求 403、错方法 405
+- `test/host.test.mjs`：frontmatter 解析 / 布尔语法 / 开关改写 / 两层去重 / 占位 / 导入 / 自造 zip / 与 DSH 加载器同口径的校验
+- `test/apply.test.mjs`：假 ctx 真跑 `apply()`，验证 9 条路由都注册、`/list` 出数、flags/create/save/delete 真的落盘、跨站请求 403、错方法 405、向 DSH 注册表核对加载状态
 
 ## 已知限制
 
@@ -90,4 +101,6 @@ node --test test/host.test.mjs test/apply.test.mjs
 - 只扫面板认得的四个默认根；宿主 `customSkillDirs` 里挂的技能不在列表里（宁可漏报也不误报）。
 - 预设层（preset 自带、经作用域挂载的技能）不显示；面板只读写磁盘上的项目层与全局层。
 - 删除是移到 `~/.dsh/skill-panel-trash/`，不自动清理。
+- zip 只认根级 `SKILL.md` 或一层目录 `<dir>/SKILL.md`；更深的嵌套（如 `repo-main/skills/foo/SKILL.md`）会被拒绝并提示「压缩包里没有技能」。
+- DSH 加载状态只核对每个名字的生效那一份；被覆盖的副本能否被 DSH 解析不做标注。
 - 面板界面文案是中文硬编码（未经过 Client locale 服务）；插件元数据有 zh/en 两份。
