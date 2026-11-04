@@ -119,7 +119,7 @@ window.__ModuleLoader__.load({
 .dskp-root .dskp-count{min-width:22px;height:18px;padding:0 7px;border-radius:999px;background:var(--dskp-base);color:var(--dskp-fg2);font-size:11px;line-height:18px;text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}
 .dskp-root .dskp-path.dskp-ghead-path{flex:1 1 auto;min-width:0;margin-left:10px;text-align:right}
 
-.dskp-root .dskp-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 150px 64px;column-gap:14px;align-items:start;padding:10px 12px 10px 16px;border-bottom:1px solid var(--dskp-line);transition:background-color .12s}
+.dskp-root .dskp-row{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 64px;column-gap:14px;align-items:start;padding:10px 12px 10px 16px;border-bottom:1px solid var(--dskp-line);transition:background-color .12s}
 .dskp-root .dskp-row:hover{background-color:color-mix(in srgb,var(--dskp-l2) 55%,transparent)}
 .dskp-root .dskp-row.is-stub{box-shadow:inset 3px 0 0 var(--dskp-warn)}
 .dskp-root .dskp-info{min-width:0;display:flex;flex-direction:column;gap:2px}
@@ -134,7 +134,6 @@ window.__ModuleLoader__.load({
 .dskp-root .dskp-desc{height:34px;font-size:12px;line-height:17px;color:var(--dskp-fg2);display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}
 .dskp-root .dskp-desc.is-empty{color:var(--dskp-fg3)}
 .dskp-root .dskp-path{height:16px;font-family:var(--dskp-mono);font-size:11px;line-height:16px;color:var(--dskp-fg3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
-.dskp-root .dskp-side{display:flex;flex-direction:column;gap:10px;min-width:0}
 .dskp-root .dskp-actions{display:flex;justify-content:flex-end;gap:2px}
 
 .dskp-root .dskp-seg{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:2px;height:28px;padding:2px;border-radius:999px;border:1px solid var(--dskp-line2);background:var(--dskp-base)}
@@ -826,7 +825,8 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function SkillRow({ skill, hasProject, busy, confirming, flashToken, onScope, onOpen, onAskDelete, onCancelDelete, onConfirmDelete }) {
+    /** 技能装在哪里只在新建 / 导入时决定，列表里不再提供「全局 ⇄ 本项目」切换。 */
+    function SkillRow({ skill, busy, confirming, flashToken, onOpen, onAskDelete, onCancelDelete, onConfirmDelete }) {
       const stub = !!skill.stub
       const base = stub ? globalLayerOf(skill) || skill : skill
       const shadowed = skill.shadowed || []
@@ -855,11 +855,6 @@ window.__ModuleLoader__.load({
       const dshIssue = dshProblem(skill.dsh)
       const invocation = stub || dshIssue ? null : invocationState(skill)
 
-      const scopeOptions = [
-        { value: 'global', label: '全局', title: stub ? '恢复全局' : '切到全局' },
-        { value: 'project', label: '本项目', disabled: !hasProject, title: hasProject ? '切到本项目' : '没有项目目录' },
-      ]
-
       return h(
         'div',
         {
@@ -887,18 +882,6 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: cx('dskp-desc', !description && 'is-empty'), title: description || undefined }, description || '无描述'),
           h(PathText, { path: base.path }),
-        ),
-        h(
-          'div',
-          { className: 'dskp-side' },
-          h(Segmented, {
-            label: `${skill.name} 作用域`,
-            options: scopeOptions,
-            value: stub ? null : skill.scope,
-            pending: busy && busy.action === 'scope' ? busy.target : null,
-            disabled: !!busy,
-            onSelect: (next) => onScope(skill, next),
-          }),
         ),
         h(
           'div',
@@ -956,7 +939,6 @@ window.__ModuleLoader__.load({
               ),
               h('div', { className: 'dskp-path' }, h('span', { className: 'dskp-skel', style: { width: '48%', height: 8, marginTop: 4 } })),
             ),
-            h('div', { className: 'dskp-side' }, h('span', { className: 'dskp-skel', style: { height: 28, borderRadius: 999 } })),
             h('div', null),
           ),
         ),
@@ -1931,13 +1913,6 @@ window.__ModuleLoader__.load({
         [load, pushToast],
       )
 
-      const changeScope = useCallback(
-        (skill, target) => {
-          const text = skill.stub && target === 'global' ? `${skill.name} 已恢复全局` : `${skill.name} 已切到${scopeLabel(target)}`
-          runRow(skill, { action: 'scope', target }, () => postJson(api('scope', { project: projectRef.current }), { name: skill.name, scope: target }), text)
-        },
-        [runRow],
-      )
 
       const askDelete = useCallback((skill) => setConfirmName(skill.name), [])
       const cancelDelete = useCallback(() => setConfirmName(null), [])
@@ -2023,7 +1998,7 @@ window.__ModuleLoader__.load({
         if (!root || (active && active !== document.body && root.contains(active))) return
         const scroller = scrollRef.current
         const row = scroller && scroller.querySelector(`[data-skill="${cssEscape(focusTarget.name)}"]`)
-        const target = row ? row.querySelector('.dskp-seg-btn.is-on') || row.querySelector('button:not([disabled]):not([tabindex="-1"])') : searchRef.current
+        const target = row ? row.querySelector('button:not([disabled]):not([tabindex="-1"])') : searchRef.current
         focusQuietly(target)
       }, [focusTarget])
 
@@ -2086,11 +2061,9 @@ window.__ModuleLoader__.load({
           h(SkillRow, {
             key: skill.name,
             skill,
-            hasProject,
             busy: busyRows[skill.name] || null,
             confirming: confirmName === skill.name,
             flashToken: flash && flash.name === skill.name ? flash.token : 0,
-            onScope: changeScope,
             onOpen: openDetail,
             onAskDelete: askDelete,
             onCancelDelete: cancelDelete,

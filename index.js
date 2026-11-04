@@ -176,16 +176,25 @@ export function apply(ctx) {
 
   const LOCAL_SOURCES = new Set(['project-dsh', 'project-agents', 'user-dsh', 'user-agents'])
 
-  const addSummaries = (byName, probe, summaries) => {
+  /**
+   * 按名字收集「各 preset 各自的胜出者」：同名技能在不同 preset 里可能不同
+   * （例如创造模式额外挂了 custom 根，rank 300 压过 user-dsh 400），不能只留第一个。
+   * winners: name → summary[]，union 语义在 dshStateOf 里判断。
+   */
+  const addSummaries = (winners, probe, summaries) => {
     for (const summary of summaries || []) {
       if (!summary || typeof summary.name !== 'string') continue
       const source = String(summary.source ?? '?')
       const provider = String(summary.provider ?? '?')
       probe.bySource[source] = (probe.bySource[source] || 0) + 1
       probe.byProvider[provider] = (probe.byProvider[provider] || 0) + 1
-      if (!byName.has(summary.name)) byName.set(summary.name, summary)
+      const list = winners.get(summary.name)
+      if (!list) winners.set(summary.name, [summary])
+      else if (!list.some((item) => item.source === summary.source && item.path === summary.path)) list.push(summary)
     }
   }
+
+  const hasLocalWinner = (winners) => [...winners.values()].some((list) => list.some((summary) => LOCAL_SOURCES.has(String(summary.source))))
 
   /** 按作用域读一次注册表；snapshot 优先，只有 list 的旧实现也能用。 */
   const readScope = async (registry, cwd, scope, signal) => {
@@ -230,9 +239,9 @@ export function apply(ctx) {
       presets: [],
     }
     const registry = dshRegistry()
-    if (!registry) return { byName: undefined, probe }
+    if (!registry) return { winners: undefined, probe }
     const signal = typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(5000) : undefined
-    const byName = new Map()
+    const winners = new Map()
     try {
       const presetsService = dshPresets()
       if (presetsService) {
@@ -263,7 +272,7 @@ export function apply(ctx) {
               complete: snapshot.complete,
             })
             if (!snapshot.complete) probe.complete = false
-            addSummaries(byName, probe, snapshot.skills)
+            addSummaries(winners, probe, snapshot.skills)
           } catch (error) {
             probe.presets.push({ id, error: error instanceof Error ? error.message : String(error) })
           } finally {
@@ -277,27 +286,27 @@ export function apply(ctx) {
           }
         }
         // 预设层一个本地技能都没有时，再退回全局层确认，避免把「作用域没挂上」误判成「技能都没加载」
-        if (![...byName.values()].some((summary) => LOCAL_SOURCES.has(String(summary.source)))) {
+        if (!hasLocalWinner(winners)) {
           const snapshot = await readScope(registry, cwd, undefined, signal)
           if (!snapshot.complete) probe.complete = false
-          addSummaries(byName, probe, snapshot.skills)
+          addSummaries(winners, probe, snapshot.skills)
         }
       } else {
         const snapshot = await readScope(registry, cwd, undefined, signal)
         probe.complete = snapshot.complete
-        addSummaries(byName, probe, snapshot.skills)
+        addSummaries(winners, probe, snapshot.skills)
       }
-      probe.total = byName.size
-      probe.sample = [...byName.keys()].slice(0, 12)
+      probe.total = winners.size
+      probe.sample = [...winners.keys()].slice(0, 12)
       if (probe.complete === false) probe.verdict = 'incomplete'
-      else if (![...byName.values()].some((summary) => LOCAL_SOURCES.has(String(summary.source)))) probe.verdict = 'no-local-skills'
+      else if (!hasLocalWinner(winners)) probe.verdict = 'no-local-skills'
       else probe.verdict = 'checked'
-      return { byName, probe }
+      return { winners, probe }
     } catch (error) {
       probe.verdict = 'error'
       probe.error = error instanceof Error ? error.message : String(error)
       log(`dsh-skill-panel: 读取 DSH 技能注册表失败：${probe.error}`)
-      return { byName: undefined, probe }
+      return { winners: undefined, probe }
     }
   }
 
@@ -317,30 +326,113 @@ export function apply(ctx) {
     return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
   }
 
-  /**
-   * loaded：DSH 生效的正是这一份文件；
-   * other：DSH 生效的是别处的同名技能（这份没被采用）；
-   * missing：DSH 没有加载这个名字（通常是 frontmatter 不被 DSH 接受）。
-   */
-  const dshStateOf = async (record, name, catalog) => {
-    const winner = catalog.get(name)
-    if (!winner) return { state: 'missing' }
-    if (winner.source === record.source) {
-      if (!winner.path || samePath(winner.path, record.path)) return { state: 'loaded' }
-      const real = await fsp.realpath(record.path).catch(() => record.path)
-      if (samePath(winner.path, real)) return { state: 'loaded' }
-    }
-    return { state: 'other', source: winner.source, ...(winner.path ? { path: winner.path } : {}) }
+  /** DSH 的某个胜出者是不是正好指向这一份文件（同一来源、同一路径，路径按 realpath 兜底比较）。 */
+  const pointsAt = async (winner, record, realOf) => {
+    if (winner.source !== record.source) return false
+    if (!winner.path || samePath(winner.path, record.path)) return true
+    return samePath(winner.path, await realOf())
   }
 
-  /** 给刚导入 / 新建的技能补上 DSH 加载状态（先丢掉自己的快照缓存）。 */
-  const annotateWritten = async (items, source, targetRoot, cwd) => {
+  /**
+   * union 语义——任一 preset 里生效的正是这一份，就算会被加载：
+   * loaded：至少一个 preset 的胜出者就是这一份文件；
+   * other：DSH 有同名技能，但没有任何 preset 采用这一份；
+   * missing：没有任何 preset 加载这个名字（通常是 frontmatter 不被 DSH 接受）。
+   */
+  const dshStateOf = async (record, name, winners) => {
+    const list = winners.get(name) || []
+    if (!list.length) return { state: 'missing' }
+    let real
+    const realOf = async () => {
+      if (real === undefined) real = await fsp.realpath(record.path).catch(() => record.path)
+      return real
+    }
+    for (const winner of list) if (await pointsAt(winner, record, realOf)) return { state: 'loaded' }
+    const other = list.find((item) => LOCAL_SOURCES.has(String(item.source))) || list[0]
+    return { state: 'other', source: other.source, ...(other.path ? { path: other.path } : {}) }
+  }
+
+  /* ---------------------------------------------- 写操作后等 DSH 追上磁盘 */
+
+  const DSH_SETTLE_MS = 1500
+  const DSH_SETTLE_STEP_MS = 150
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  /**
+   * DSH 这一轮的视图是否已经反映出磁盘上的这一份：
+   * - 磁盘上有这份（expected 为面板扫描到的胜出记录）：某个 preset 的胜出者正是它，且两个开关一致；
+   * - 磁盘上没有了（删除，或文件已无效）：DSH 也不该再有本地来源的同名胜出者。
+   */
+  const reflects = async (list, expected) => {
+    if (!expected) return !list.some((item) => LOCAL_SOURCES.has(String(item.source)))
+    let real
+    const realOf = async () => {
+      if (real === undefined) real = await fsp.realpath(expected.path).catch(() => expected.path)
+      return real
+    }
+    for (const winner of list) {
+      if (!(await pointsAt(winner, expected, realOf))) continue
+      const invocation = winner.invocation
+      if (!invocation) return true
+      if (invocation.modelInvocable === expected.modelInvocable && invocation.userInvocable === expected.userInvocable) return true
+    }
+    return false
+  }
+
+  /**
+   * 写操作之后、返回之前，等 DSH 注册表追上磁盘。
+   * DSH 靠目录监听让注册表缓存失效（chokidar 约 200ms 稳定期，目录原本不存在时还要轮询祖先目录），
+   * 写完马上 /list 会读到写之前的视图——典型症状是「刚切到本项目就显示未生效」，手动刷新才恢复。
+   * DSH 没有公开的刷新接口，所以这里以面板自己扫描磁盘的结果为期望值，每 DSH_SETTLE_STEP_MS 读一次，
+   * 最多等 DSH_SETTLE_MS；追上就立即返回，并把这次结果放进面板缓存，紧接着的 /list 直接复用。
+   * 只有文件本身被 DSH 拒绝时才会等满（随后如实标出「DSH 未加载」）。
+   */
+  const settleDsh = async (context, names) => {
     invalidateDshCache()
-    const { byName, probe } = await dshCatalog(cwd)
+    const cwd = context.projectCwd || ''
+    const wanted = [...new Set((names || []).filter((name) => typeof name === 'string' && name))]
+    if (!wanted.length || !dshRegistry()) return dshCatalog(cwd)
+    const collection = await collectSkills({ projectRoot: context.projectRoot, dshHome: dshHome(), agentsHome: agentsHome() })
+    const expected = wanted.map((name) => ({ name, record: collection.skills.find((skill) => skill.name === name) || null }))
+    const started = Date.now()
+    let rounds = 0
+    let settled = false
+    let result
+    for (;;) {
+      result = await dshCatalogUncached(cwd)
+      rounds += 1
+      if (result.probe.verdict !== 'checked') break
+      settled = true
+      for (const { name, record } of expected) {
+        if (!(await reflects(result.winners.get(name) || [], record))) {
+          settled = false
+          break
+        }
+      }
+      if (settled || Date.now() - started + DSH_SETTLE_STEP_MS > DSH_SETTLE_MS) break
+      await sleep(DSH_SETTLE_STEP_MS)
+    }
+    result.probe.settle = { names: wanted, rounds, settled, waitedMs: Date.now() - started }
+    dshCache = { key: cwd, at: Date.now(), value: result }
+    return result
+  }
+
+  /** 写操作统一出口：等 DSH 追上再回 200，并标记已刷新（guard 不必再清缓存）。 */
+  const finishWrite = async (res, context, names, payload) => {
+    await settleDsh(context, names)
+    res.dshSettled = true
+    sendJson(res, 200, payload)
+  }
+
+  /** 给刚导入 / 新建的技能补上 DSH 加载状态（先等 DSH 追上磁盘）。 */
+  const annotateWritten = async (items, source, targetRoot, context, res) => {
+    const names = items.filter((item) => item.ok && item.name).map((item) => item.name)
+    const { winners, probe } = await settleDsh(context, names)
+    if (res) res.dshSettled = true
     if (probe.verdict !== 'checked') return items
     for (const item of items) {
       if (!item.ok || !item.name) continue
-      item.dsh = await dshStateOf({ source, path: path.join(targetRoot, item.name, 'SKILL.md') }, item.name, byName)
+      item.dsh = await dshStateOf({ source, path: path.join(targetRoot, item.name, 'SKILL.md') }, item.name, winners)
     }
     return items
   }
@@ -382,8 +474,8 @@ export function apply(ctx) {
         return
       }
       await handler(req, res)
-      // 写操作成功后丢掉自己的快照缓存，面板随后的 /list 才会重新核对
-      if (req.method === 'POST' && res.statusCode === 200) invalidateDshCache()
+      // 写操作成功后，面板随后的 /list 必须是新视图：走过 settleDsh 的已经放好新结果，其余一律清缓存
+      if (req.method === 'POST' && res.statusCode === 200 && !res.dshSettled) invalidateDshCache()
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       sendJson(res, 400, { ok: false, errors: [message] })
@@ -401,10 +493,10 @@ export function apply(ctx) {
         }
         const url = new URL(req.url, 'http://localhost')
         const context = await collectionOf(url)
-        const { byName, probe } = await dshCatalog(context.projectCwd)
+        const { winners, probe } = await dshCatalog(context.projectCwd)
         const checked = probe.verdict === 'checked'
         const skills = checked
-          ? await Promise.all(context.collection.skills.map(async (skill) => ({ ...skill, dsh: await dshStateOf(skill, skill.name, byName) })))
+          ? await Promise.all(context.collection.skills.map(async (skill) => ({ ...skill, dsh: await dshStateOf(skill, skill.name, winners) })))
           : context.collection.skills
         sendJson(res, 200, {
           ok: true,
@@ -466,7 +558,7 @@ export function apply(ctx) {
         const context = await collectionOf(url)
         const location = await locateSkill(context.collection, String(body.name || ''), String(body.source || ''))
         await saveSkillDoc(location, body.content ?? '')
-        sendJson(res, 200, { ok: true, path: location.record.path })
+        await finishWrite(res, context, [location.skill.name], { ok: true, path: location.record.path })
       }),
     }),
   )
@@ -488,7 +580,7 @@ export function apply(ctx) {
           model: typeof body.model === 'boolean' ? body.model : undefined,
           user: typeof body.user === 'boolean' ? body.user : undefined,
         })
-        sendJson(res, 200, { ok: true, path: location.record.path })
+        await finishWrite(res, context, [location.skill.name], { ok: true, path: location.record.path })
       }),
     }),
   )
@@ -530,7 +622,7 @@ export function apply(ctx) {
             if (!globalLayer) throw new Error('找不到同名全局技能')
             await flagsOnSource(globalLayer.source, { model: true, user: true })
             await removeStub(projectRoot, name)
-            sendJson(res, 200, { ok: true })
+            await finishWrite(res, context, [name], { ok: true })
             return
           }
           // 项目里的真实技能：提升为全局。
@@ -539,7 +631,7 @@ export function apply(ctx) {
           if (globalLayer && (await sameSkillContent(winner.path, winner.kind, globalLayer.path, globalLayer.kind))) {
             await flagsOnSource(globalLayer.source, { model: true, user: true })
             await fsp.rm(sourceDir, { recursive: true, force: true })
-            sendJson(res, 200, { ok: true, reused: true })
+            await finishWrite(res, context, [name], { ok: true, reused: true })
             return
           }
           const globalRoot = path.join(dshHome(), 'skills')
@@ -554,7 +646,7 @@ export function apply(ctx) {
           if (existsSync(globalTarget)) await moveToTrash(globalTarget, `${name}-global-old`)
           await copySkillInto(globalRoot, name, { sourcePath: winner.path, sourceKind: winner.kind, enable: true })
           await moveToTrash(sourceDir, name)
-          sendJson(res, 200, { ok: true })
+          await finishWrite(res, context, [name], { ok: true })
           return
         }
 
@@ -572,7 +664,7 @@ export function apply(ctx) {
         }
         await copySkillInto(projectSkillsRoot, name, { sourcePath: globalLayer.path, sourceKind: globalLayer.kind, enable: true })
         await flagsOnSource(globalLayer.source, { model: false, user: false })
-        sendJson(res, 200, { ok: true })
+        await finishWrite(res, context, [name], { ok: true })
       }),
     }),
   )
@@ -596,7 +688,7 @@ export function apply(ctx) {
           name,
           description: String(body.description || ''),
         })
-        const [checked] = await annotateWritten([{ ok: true, name }], scope === 'global' ? 'user-dsh' : 'project-dsh', targetRoot, context.projectCwd)
+        const [checked] = await annotateWritten([{ ok: true, name }], scope === 'global' ? 'user-dsh' : 'project-dsh', targetRoot, context, res)
         sendJson(res, 200, { ok: true, path: file, ...(checked.dsh ? { dsh: checked.dsh } : {}) })
       }),
     }),
@@ -620,7 +712,7 @@ export function apply(ctx) {
         const allowed = collection.roots.some((root) => isInside(root.root, target))
         if (!allowed) throw new Error('目标不在任何技能根目录里，已拒绝删除')
         const destination = await moveToTrash(target, location.skill.name)
-        sendJson(res, 200, { ok: true, trash: destination })
+        await finishWrite(res, context, [location.skill.name], { ok: true, trash: destination })
       }),
     }),
   )
@@ -644,7 +736,7 @@ export function apply(ctx) {
           throw new Error('导入来源与目标技能目录重叠，已拒绝')
         }
         const results = await importFolder(target, source)
-        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context.projectCwd)
+        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context, res)
         sendJson(res, 200, { ok: true, results })
       }),
     }),
@@ -667,7 +759,7 @@ export function apply(ctx) {
         const results = await importZip(target, payload, {
           name: url.searchParams.get('name') || undefined,
         })
-        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context.projectCwd)
+        await annotateWritten(results, scope === 'global' ? 'user-dsh' : 'project-dsh', target, context, res)
         sendJson(res, 200, { ok: true, results })
       }),
     }),

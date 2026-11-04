@@ -180,8 +180,111 @@ test('/list 与导入结果向 DSH 注册表核对实际加载状态', async () 
     assert.equal(imported.statusCode, 200, imported.text)
     assert.equal(imported.json.results[0].ok, true)
     assert.deepEqual(imported.json.results[0].dsh, { state: 'missing' })
-    // 写操作后必须重新取一次作用域快照（缓存被丢掉）
-    assert.equal(acquired.length, 2, '写操作之后要重新核对，不能吃旧缓存')
+    // 写操作后必须重新取作用域快照（不吃旧缓存）；brand-new 永远等不到，会一直重查到截止时间
+    assert.ok(acquired.length >= 2, '写操作之后要重新核对，不能吃旧缓存')
+    assert.equal(disposed, acquired.length, '每次取到的作用域租约都要释放')
+    assert.equal(imported.json.results[0].dsh.state, 'missing')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('多个 preset 胜出者不同：任一 preset 采用这一份就算已加载', async () => {
+  const home = await makeTempDir('home-union')
+  const project = await makeTempDir('project-union')
+  await fsp.mkdir(path.join(project, '.git'), { recursive: true })
+  await fsp.mkdir(path.join(home, 'skills', 'dup'), { recursive: true })
+  const globalDup = path.join(home, 'skills', 'dup', 'SKILL.md')
+  await fsp.writeFile(globalDup, skillText('dup', '全局那份'))
+
+  // cordis 预设额外挂了 custom 根（rank 300 压过 user-dsh 400），standard 预设没有
+  const views = {
+    cordis: [{ name: 'dup', source: 'custom', path: path.join(home, 'preset-skills', 'dup', 'SKILL.md') }],
+    standard: [{ name: 'dup', source: 'user-dsh', path: globalDup }],
+  }
+  const registry = {
+    async snapshot(options) {
+      return { complete: true, skills: views[options.scope.preset] }
+    },
+  }
+  const presetsService = {
+    async list() {
+      return [{ id: 'cordis' }, { id: 'standard' }]
+    },
+    async acquireScope(id) {
+      return { key: { preset: id }, async [Symbol.asyncDispose]() {} }
+    },
+  }
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const { ctx, routes } = makeCtx([{ path: project, title: 'demo' }])
+    const baseGet = ctx.get
+    ctx.get = (name) => (name === 'skills' ? registry : name === 'agentPresets' ? presetsService : baseGet(name))
+    apply(ctx)
+    const listed = makeRes()
+    await routes.get('/api/dsh-skill-panel/list')(makeReq({ url: `/api/dsh-skill-panel/list?project=${encodeURIComponent(project)}` }), listed)
+    const dup = listed.json.skills.find((skill) => skill.name === 'dup')
+    assert.deepEqual(dup.dsh, { state: 'loaded' }, '排在前面的 preset 用的是别的副本，也不能判成未生效')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+})
+
+test('写操作后等 DSH 追上磁盘再返回：切到本项目后立刻 /list 不会误报「未生效」', async () => {
+  const home = await makeTempDir('home-settle')
+  const project = await makeTempDir('project-settle')
+  await fsp.mkdir(path.join(project, '.git'), { recursive: true })
+  await fsp.mkdir(path.join(home, 'skills', 'mover'), { recursive: true })
+  const globalPath = path.join(home, 'skills', 'mover', 'SKILL.md')
+  await fsp.writeFile(globalPath, skillText('mover', '会被搬到本项目'))
+  const projectPath = path.join(project, '.dsh', 'skills', 'mover', 'SKILL.md')
+
+  // 假注册表模拟 DSH 目录监听的延迟：写之后的前 lag 次快照仍返回写之前的视图
+  let lag = 0
+  let calls = 0
+  const registry = {
+    async snapshot() {
+      calls += 1
+      if (lag > 0) {
+        lag -= 1
+        return { complete: true, skills: [{ name: 'mover', source: 'user-dsh', path: globalPath, invocation: { modelInvocable: true, userInvocable: true } }] }
+      }
+      const skills = []
+      if (existsSync(projectPath)) skills.push({ name: 'mover', source: 'project-dsh', path: projectPath, invocation: { modelInvocable: true, userInvocable: true } })
+      else skills.push({ name: 'mover', source: 'user-dsh', path: globalPath, invocation: { modelInvocable: true, userInvocable: true } })
+      return { complete: true, skills }
+    },
+  }
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const { ctx, routes } = makeCtx([{ path: project, title: 'demo' }])
+    const baseGet = ctx.get
+    ctx.get = (name) => (name === 'skills' ? registry : baseGet(name))
+    apply(ctx)
+    const query = `?project=${encodeURIComponent(project)}`
+
+    lag = 2
+    const callsBefore = calls
+    const moved = makeRes()
+    await routes.get('/api/dsh-skill-panel/scope')(
+      makeReq({ method: 'POST', url: `/api/dsh-skill-panel/scope${query}`, body: JSON.stringify({ name: 'mover', scope: 'project' }) }),
+      moved,
+    )
+    assert.equal(moved.statusCode, 200, moved.text)
+    assert.ok(calls - callsBefore >= 3, '要一直重查到 DSH 的视图反映出项目副本')
+
+    const callsAfterWrite = calls
+    const listed = makeRes()
+    await routes.get('/api/dsh-skill-panel/list')(makeReq({ url: `/api/dsh-skill-panel/list${query}` }), listed)
+    const mover = listed.json.skills.find((skill) => skill.name === 'mover')
+    assert.equal(mover.source, 'project-dsh')
+    assert.deepEqual(mover.dsh, { state: 'loaded' }, '切到本项目后立刻刷新，不能显示「未生效」')
+    assert.equal(calls, callsAfterWrite, '紧跟着的 /list 复用写操作结束时的新视图，不再多读一次')
+    assert.equal(listed.json.dshProbe.settle.settled, true)
   } finally {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome

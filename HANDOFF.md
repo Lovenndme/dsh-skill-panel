@@ -110,3 +110,26 @@
 - `node --test test/host.test.mjs test/apply.test.mjs`：**37/37 通过**。
   新增断言覆盖：按 preset 取作用域、租约释放、`broken` preset 跳过、写操作后必须重新取快照（不吃旧缓存）。
 - 改动文件：`index.js`（DSH 核对段与 guard）、`test/apply.test.mjs`。`client.js` / `lib/skills.js` 本轮未改。
+
+## 追加问题（2026-11-04，用户实测后提出）
+
+> **状态：两项都已修复（Claude Code，2026-11-04），DSH 侧不需要再改。** 做法如下：
+> - `addSummaries` 改为按名字收集所有 preset 的胜出者（`winners: name → summary[]`）。`dshStateOf` 判定规则：任一 preset 里生效的正是这一份，就是 `loaded`；都不是才判 `other`；一个都没有才判 `missing`。
+> - 新增 `settleDsh` 和 `finishWrite`：save、flags、scope、create、delete、import 写完后，以面板自己扫描磁盘的结果作为期望值，每 150ms 重读一次各 preset 的快照，直到 DSH 视图反映出这一份文件（含两个开关），最多等 1.5s。读到的新结果直接放进面板缓存，紧接着的 `/list` 复用它，不会再多读一次；`/list` 返回的 `dshProbe.settle` 里记录了重读的轮数和耗时。整个过程不调用 `invalidateCache()`。
+> - 测试：新增「多个 preset 胜出者不同」「写后等 DSH 追上」两条（已用变异测试确认：退回旧逻辑时这两条都会失败）。`node --test test/host.test.mjs test/apply.test.mjs` 39/39 通过。
+
+### 一、写操作后马上核对，结果偏旧，短暂误报「未生效」
+
+- 现象：在 pmis-agent 把 `apifox-sync` 从全局切到本项目后，该行显示红色「未生效」（`dsh.state = other`，指向 `~/.dsh` 那份）。过一会儿手动刷新，标签就消失了。在这段时间里，技能实际生效的一直是项目副本。
+- 原因：`POST /scope` 写完立即返回，前端紧接着发 `GET /list`。这时 DSH 的 skill-filesystem 目录监听还没来得及让注册表缓存失效：chokidar 有约 200ms 的 `awaitWriteFinish`，目录原本不存在时用祖先目录 `watchFile` 轮询。所以 `snapshot` 拿到的是写入之前的视图。原先 guard 里的 `registry.invalidateCache()` 已经删掉，面板侧那 2 秒缓存只清面板自己的，清不到 DSH 注册表。
+- 建议修复（按优先顺序，可以组合使用）：
+  1. 如果 DSH 有公开的方式「等待技能目录的变更生效」或主动刷新，优先用它。
+  2. 写操作（scope / create / delete / import / save / flags）成功后，返回前等注册表追上：对受影响的技能名，轮询相关 preset 的 `snapshot`（间隔约 150ms，最多约 1.5s），直到结果和预期一致。例如 scope 切到 project 后，winner 应是 `project-dsh` 且路径匹配；delete 之后，winner 不应再是被删的那份。超时就照常返回。
+  3. 兜底：`/list` 对「最近几秒内被面板写过的技能」，如果核对结果不是 `loaded`，先当作「待定」不打标签；前端在操作完成约 1 秒后再静默刷新一次。
+- 验收：切换作用域、新建、删除、导入之后，不用手动刷新，也不会出现「未生效 / DSH 未加载」的瞬时误报；真正有问题的技能仍然能标出来。
+
+### 二、多个 preset 合并时，只保留了第一个 preset 的结论
+
+- `addSummaries` 里用的是 `if (!byName.has(name)) byName.set(name, summary)`。同名技能在不同 preset 里的 winner 不一样时，只会取排在第一个的（目前 standard 在最前面）。这和「任一 preset 能看到就算会被加载」的语义不符。例如 cordis（创造模式）额外挂了 `dsh-agent-preset/skills` 作为 custom 根，rank 300，会压过 user-dsh 的 400，所以同名时各 preset 的 winner 本来就可能不同。
+- 建议：按名字收集所有 preset 的 winner（name → summaries[]）。`dshStateOf` 改为：只要任一 winner 的 source + path 和本行一致，就判为 `loaded`；都不一致才判 `other`；一个都没有才判 `missing`。
+- 验收：补一条测试，覆盖「两个 preset 的 winner 不同」的情况。
