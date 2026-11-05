@@ -95,11 +95,23 @@ plugin_manager set_plugin --target include:dsh-skill-panel --enabled true
 ## 测试
 
 ```powershell
-node --test test/host.test.mjs test/apply.test.mjs
+npm test                 # 全部 113 条
+npm run test:unit        # 纯函数：frontmatter / 扫描 / 写入 / 导入 / zip
+npm run test:host        # 路由层：鉴权、方法、体积上限、并发、响应契约
+npm run test:client      # 浏览器半区：组件渲染与「点了按钮发什么请求」
 ```
 
-- `test/host.test.mjs`：frontmatter 解析 / 布尔语法 / 开关改写 / 两层去重 / 占位 / 导入 / 自造 zip / 与 DSH 加载器同口径的校验
-- `test/apply.test.mjs`：假 ctx 真跑 `apply()`，验证 9 条路由都注册、`/list` 出数、flags/create/save/delete 真的落盘、跨站请求 403、错方法 405、向 DSH 注册表核对加载状态
+| 文件 | 覆盖 |
+|---|---|
+| `test/host.test.mjs` | frontmatter 解析 / 布尔语法 / 开关改写 / 两层去重 / 占位 / 导入 / 自造 zip |
+| `test/lib-deep.test.mjs` | 边界与对抗：块标量里的 `---`、CRLF/BOM 保真、目录链接（junction）、坏链接诊断、同层同名、并发写串行化、zip 炸弹与路径穿越、200 条技能的性能护栏 |
+| `test/apply.test.mjs` | 假 ctx 真跑 `apply()`：路由注册、落盘、跨站拒绝、按 preset 作用域核对 DSH 加载状态、作用域双向切换 |
+| `test/routes.test.mjs` | Connection 鉴权（401/403）、405、坏 JSON、2MB 体积上限、路径越界、并发交错、zip 经 HTTP 落盘、格式保真回归（块标量/CRLF/emoji 不被改写） |
+| `test/client.test.mjs` | 用极简 React 替身真跑 `client.js`：插槽注册契约、首屏骨架、搜索过滤、删除二次确认、详情读文件与开关请求、错误展示 |
+| `test/integration.test.mjs` | 端到端：真 `node:http` 服务器 + 真宿主路由 + 真磁盘 + 真客户端组件（切开关改文件、创建技能、删除进回收目录） |
+
+`test/helpers/mini-react.mjs` 是那个极简 React 替身（createElement + 5 个 hook + forwardRef + 错误边界）。
+它只实现 `client.js` 用到的子集：hook 状态按组件在树里的路径保存，条件渲染会让状态错位——面板目前没有这种写法。
 
 ## 已知限制
 

@@ -23,7 +23,10 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test/host.test.mjs test/apply.test.mjs"
+    "test": "node --test test/host.test.mjs test/lib-deep.test.mjs test/apply.test.mjs test/routes.test.mjs test/client.test.mjs test/integration.test.mjs",
+    "test:unit": "node --test test/host.test.mjs test/lib-deep.test.mjs",
+    "test:host": "node --test test/apply.test.mjs test/routes.test.mjs",
+    "test:client": "node --test test/client.test.mjs test/integration.test.mjs"
   },
   "keywords": [
     "dsh",

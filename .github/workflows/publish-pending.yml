@@ -94,7 +94,7 @@ jobs:
           node --check index.js
           node --check client.js
           node --check lib/skills.js
-          node --test test/host.test.mjs test/apply.test.mjs
+          npm test
 
       - name: Commit the release
         if: steps.gate.outputs.pending == 'true'

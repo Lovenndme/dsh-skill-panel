@@ -77,7 +77,12 @@ async function readBody(req, limit) {
 async function readJson(req) {
   const buffer = await readBody(req, JSON_LIMIT)
   if (!buffer.length) return {}
-  return JSON.parse(buffer.toString('utf8'))
+  const text = buffer.toString('utf8')
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error('请求体不是合法 JSON')
+  }
 }
 
 export function apply(ctx) {
