@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 — 2026-11-05
+
+- release: v0.1.2
+- test: add deep, route, client and end-to-end suites; fix block-scalar corruption, symlink discovery and Windows rename races
+
+
 ## 0.1.2 — 2026-11-05
 
 - test: add deep, route, client and end-to-end suites; fix block-scalar corruption, symlink discovery and Windows rename races
