@@ -1,6 +1,6 @@
 {
   "name": "@lovenndme/dsh-skill-panel",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Skill management panel for the DeepSeek Harness Web UI: lists global and per-project skills, enables or disables model and slash-command invocation, previews and edits SKILL.md, and creates, imports or deletes skills.",
   "type": "module",
   "main": "index.js",

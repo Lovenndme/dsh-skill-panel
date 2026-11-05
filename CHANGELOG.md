@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 — 2026-11-05
+
+- test: add deep, route, client and end-to-end suites; fix block-scalar corruption, symlink discovery and Windows rename races
+
+
 ## 0.1.1 — 2026-11-04
 
 - test: make isInside boundary test platform-independent so CI on Linux passes
